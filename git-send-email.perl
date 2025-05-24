@@ -73,7 +73,10 @@ git send-email --translate-aliases
     --no-smtp-auth                 * Disable SMTP authentication. Shorthand for
                                      `--smtp-auth=none`
     --smtp-debug            <0|1>  * Disable, enable Net::SMTP debug.
-
+    --[no-]use-msgraph             * Use Microsoft Graph API instead of SMTP.
+    --msgraph-user          <str>  * Username in case an email API is used.
+                                     If not specified, the from address is used.
+    --msgraph-token         <str>  * OAuth2.0 access token for the email API.
     --batch-size            <int>  * send max <int> message per connection.
     --relogin-delay         <int>  * delay <int> seconds between two successive login.
                                      This option can only be used with --batch-size
@@ -201,7 +204,7 @@ my $re_encoded_word = qr/=\?($re_token)\?($re_token)\?($re_encoded_text)\?=/;
 # Variables we fill in automatically, or via prompting:
 my (@to,@cc,@xh,$envelope_sender,
 	$initial_in_reply_to,$reply_to,$initial_subject,@files,
-	$author,$sender,$smtp_authpass,$annotate,$compose,$time);
+	$author,$sender,$smtp_authpass,$annotate,$compose,$time,$msgraph_token);
 # Things we either get from config, *or* are overridden on the
 # command-line.
 my ($no_cc, $no_to, $no_bcc, $no_identity, $no_header_cmd);
@@ -283,6 +286,7 @@ my ($auto_8bit_encoding);
 my ($compose_encoding);
 my ($sendmail_cmd);
 my ($mailmap_file, $mailmap_blob);
+my ($msgraph_user);
 # Variables with corresponding config settings & hardcoded defaults
 my ($debug_net_smtp) = 0;		# Net::SMTP, see send_message()
 my $thread = 1;
@@ -293,6 +297,7 @@ my $mailmap = 0;
 my $target_xfer_encoding = 'auto';
 my $forbid_sendmail_variables = 1;
 my $outlook_id_fix = 'auto';
+my $use_msgraph = 0;
 
 my %config_bool_settings = (
     "thread" => \$thread,
@@ -309,6 +314,7 @@ my %config_bool_settings = (
     "forbidsendmailvariables" => \$forbid_sendmail_variables,
     "mailmap" => \$mailmap,
     "outlookidfix" => \$outlook_id_fix,
+    "usemsgraph" => \$use_msgraph,
 );
 
 my %config_settings = (
@@ -337,6 +343,8 @@ my %config_settings = (
     "composeencoding" => \$compose_encoding,
     "transferencoding" => \$target_xfer_encoding,
     "sendmailcmd" => \$sendmail_cmd,
+    "msgraphuser" => \$msgraph_user,
+    "msgraphtoken" => \$msgraph_token,
 );
 
 my %config_path_settings = (
@@ -556,6 +564,9 @@ my %options = (
 		    "git-completion-helper" => \$git_completion_helper,
 		    "v=s" => \$reroll_count,
 		    "outlook-id-fix!" => \$outlook_id_fix,
+		    "use-msgraph!" => \$use_msgraph,
+		    "msgraph-user=s" => \$msgraph_user,
+		    "msgraph-token:s" => \$msgraph_token,
 );
 $rc = GetOptions(%options);
 
@@ -1095,7 +1106,7 @@ if (defined $reply_to) {
 	$reply_to = sanitize_address($reply_to);
 }
 
-if (!defined $sendmail_cmd && !defined $smtp_server) {
+if (!defined $sendmail_cmd && !defined $smtp_server && !$use_msgraph) {
 	my @sendmail_paths = qw( /usr/sbin/sendmail /usr/lib/sendmail );
 	push @sendmail_paths, map {"$_/sendmail"} split /:/, $ENV{PATH};
 	foreach (@sendmail_paths) {
@@ -1603,6 +1614,7 @@ sub is_outlook {
 sub send_message {
 	my ($recipients_ref, $to, $date, $gitversion, $cc, $ccline, $header) = gen_header();
 	my @recipients = @$recipients_ref;
+	my $msgraph_response_code;
 
 	my @sendmail_parameters = ('-i', @recipients);
 	my $raw_from = $sender;
@@ -1680,6 +1692,52 @@ EOF
 		}
 		print $sm "$header\n$message";
 		close $sm or die $!;
+	} elsif ($use_msgraph) {
+		# Use Microsoft Graph API
+		# https://learn.microsoft.com/en-us/graph/api/user-sendmail
+		my $auth_api;
+		if (!defined $msgraph_user) {
+			$msgraph_user = (defined $smtp_authuser
+				? $smtp_authuser
+				: $raw_from
+			);
+		}
+		require MIME::Base64;
+		require HTTP::Tiny;
+		$auth_api = Git::credential({
+			'protocol' => 'https',
+			'host' => 'graph.microsoft.com',
+			'username' => $msgraph_user,
+			'password' => $msgraph_token,
+		}, sub {
+			my $cred = shift;
+			$msgraph_token = $cred->{'password'};
+		});
+		my $email_url = "https://graph.microsoft.com/v1.0/users/$msgraph_user/sendMail";
+		my $real_message = "$header\n$message\n";
+		# Convert LF to CRLF
+		unless ($real_message =~ /\r\n/) {
+			$real_message =~ s/\r?\n/\r\n/g;
+		}
+		# The API requires the message to be base64 encoded if sending in MIME format.
+		my $encoded_message = MIME::Base64::encode_base64($real_message, "");
+		my $http = HTTP::Tiny->new(
+			default_headers => {
+				'Authorization' => "Bearer $msgraph_token",
+				'Content-Type'  => 'text/plain',
+			},
+		);
+		my $response = $http->post($email_url, {
+			content => $encoded_message,
+		});
+
+
+		if (!$response->{success}) {
+			die sprintf(__("Failed to send email: %s\nResponse: %s"),
+				$response->{status}, $response->{content});
+		} else {
+			$msgraph_response_code = $response->{status};
+		}
 	} else {
 
 		if (!defined $smtp_server) {
@@ -1790,12 +1848,15 @@ EOF
 	} else {
 		print($dry_run ? __("Dry-OK. Log says:") : __("OK. Log says:"));
 		print "\n";
-		if (!defined $sendmail_cmd && !file_name_is_absolute($smtp_server)) {
+		if (!defined $sendmail_cmd && !file_name_is_absolute($smtp_server)
+		   && !$use_msgraph) {
 			print "Server: $smtp_server\n";
 			print "MAIL FROM:<$raw_from>\n";
 			foreach my $entry (@recipients) {
 			    print "RCPT TO:<$entry>\n";
 			}
+		} elsif ($use_msgraph) {
+			print "Email API: Microsoft Graph API\n";
 		} else {
 			my $sm;
 			if (defined $sendmail_cmd) {
@@ -1810,6 +1871,8 @@ EOF
 		if ($smtp) {
 			print __("Result: "), $smtp->code, ' ',
 				($smtp->message =~ /\n([^\n]+\n)$/s);
+		} elsif (defined $msgraph_response_code) {
+			print __("Result: "), $msgraph_response_code;
 		} else {
 			print __("Result: OK");
 		}
