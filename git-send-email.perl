@@ -73,7 +73,13 @@ git send-email --translate-aliases
     --no-smtp-auth                 * Disable SMTP authentication. Shorthand for
                                      `--smtp-auth=none`
     --smtp-debug            <0|1>  * Disable, enable Net::SMTP debug.
-
+    --email-api             <str>  * API to use for sending emails.
+                                     Available APIs are:
+                                       - MSGRAPH: use Microsoft Graph API.
+									   - GMAIL: use Gmail API.
+    --email-api-user        <str>  * Username in case an email API is used.
+                                     If not specified, the from address is used.
+    --email-api-pass        <str>  * Password/OAuth2.0 access token for the email API.
     --batch-size            <int>  * send max <int> message per connection.
     --relogin-delay         <int>  * delay <int> seconds between two successive login.
                                      This option can only be used with --batch-size
@@ -201,7 +207,7 @@ my $re_encoded_word = qr/=\?($re_token)\?($re_token)\?($re_encoded_text)\?=/;
 # Variables we fill in automatically, or via prompting:
 my (@to,@cc,@xh,$envelope_sender,
 	$initial_in_reply_to,$reply_to,$initial_subject,@files,
-	$author,$sender,$smtp_authpass,$annotate,$compose,$time);
+	$author,$sender,$smtp_authpass,$annotate,$compose,$time,$email_api_pass);
 # Things we either get from config, *or* are overridden on the
 # command-line.
 my ($no_cc, $no_to, $no_bcc, $no_identity, $no_header_cmd);
@@ -283,6 +289,7 @@ my ($auto_8bit_encoding);
 my ($compose_encoding);
 my ($sendmail_cmd);
 my ($mailmap_file, $mailmap_blob);
+my ($email_api, $email_api_user);
 # Variables with corresponding config settings & hardcoded defaults
 my ($debug_net_smtp) = 0;		# Net::SMTP, see send_message()
 my $thread = 1;
@@ -337,6 +344,9 @@ my %config_settings = (
     "composeencoding" => \$compose_encoding,
     "transferencoding" => \$target_xfer_encoding,
     "sendmailcmd" => \$sendmail_cmd,
+	"emailapi" => \$email_api,
+	"emailapiuser" => \$email_api_user,
+	"emailapipass" => \$email_api_pass,
 );
 
 my %config_path_settings = (
@@ -556,6 +566,9 @@ my %options = (
 		    "git-completion-helper" => \$git_completion_helper,
 		    "v=s" => \$reroll_count,
 		    "outlook-id-fix!" => \$outlook_id_fix,
+		    "email-api=s" => \$email_api,
+		    "email-api-user=s" => \$email_api_user,
+			"email-api-pass:s" => \$email_api_pass,
 );
 $rc = GetOptions(%options);
 
@@ -1095,7 +1108,7 @@ if (defined $reply_to) {
 	$reply_to = sanitize_address($reply_to);
 }
 
-if (!defined $sendmail_cmd && !defined $smtp_server) {
+if (!defined $sendmail_cmd && !defined $smtp_server && !defined $email_api) {
 	my @sendmail_paths = qw( /usr/sbin/sendmail /usr/lib/sendmail );
 	push @sendmail_paths, map {"$_/sendmail"} split /:/, $ENV{PATH};
 	foreach (@sendmail_paths) {
@@ -1680,6 +1693,110 @@ EOF
 		}
 		print $sm "$header\n$message";
 		close $sm or die $!;
+	} elsif (defined $email_api) {
+		my $auth_api;
+		if (!defined $email_api_user) {
+			$email_api_user = $raw_from;
+		}
+
+		if ($email_api eq 'MSGRAPH') {
+			require MIME::Base64;
+			require LWP::UserAgent;
+			$auth_api = Git::credential({
+				'protocol' => 'https',
+				'host' => 'graph.microsoft.com',
+				'username' => $email_api_user,
+				'password' => $email_api_pass,
+			}, sub {
+				my $cred = shift;
+				$email_api_pass = $cred->{'password'};
+			});
+			my $email_url = "https://graph.microsoft.com/v1.0/users/$email_api_user/sendMail";
+			my $real_message = "$header\n$message\n";
+			$real_message =~ s/\r?\n/\r\n/g; # Ensure CRLF line endings
+			my $encoded_message = MIME::Base64::encode_base64($real_message, "");
+			my $ua = LWP::UserAgent->new;
+			my $req = HTTP::Request->new(POST => $email_url);
+			$req->header('Authorization' => "Bearer $email_api_pass");
+			$req->header('Content-Type'  => 'text/plain');
+			$req->content($encoded_message);
+			my $res = $ua->request($req);
+
+			if (!$res->is_success || !$res->code == 202) {
+				die sprintf(__("Failed to send email: %s\nResponse: %s"),
+					$res->code, $res->decoded_content);
+			}
+		} elsif ($email_api eq 'GMAIL') {
+			require MIME::Base64;
+			require LWP::UserAgent;
+			require JSON;
+			$auth_api = Git::credential({
+				'protocol' => 'https',
+				'host' => 'gmail.googleapis.com',
+				'username' => $email_api_user,
+				'password' => $email_api_pass,
+			}, sub {
+				my $cred = shift;
+				$email_api_pass = $cred->{'password'};
+			});
+			my $email_url = "https://gmail.googleapis.com/gmail/v1/users/$email_api_user/messages/send";
+			my $real_message = "$header\n$message\n";
+			$real_message =~ s/\r?\n/\r\n/g; # Ensure CRLF line endings
+			my $encoded_message = MIME::Base64::encode_base64($real_message, "");
+			$encoded_message =~ tr/+\//-_/;    # URL-safe needed for Gmail API
+			$encoded_message =~ s/=+$//;       # Remove trailing '='
+			my $payload = JSON::encode_json({ raw => $encoded_message });
+			my $ua = LWP::UserAgent->new;
+			my $req = HTTP::Request->new(POST => $email_url);
+			$req->header('Authorization' => "Bearer $email_api_pass");
+			$req->header('Content-Type'  => 'application/json');
+			$req->content($payload);
+			my $res = $ua->request($req);
+
+			if ($res->is_success && $res->code == 200) {
+				# Gmail API modifies the Message-ID header, sigh.
+				# The server response gives us a special ID, which
+				# we can use to track the message, and retrieve the
+				# new Message-ID.
+				my $reply = $res->decoded_content;
+				my $reply_parse = eval { JSON::decode_json($reply) };
+				if ($reply_parse->{id}) {
+					my $reply_id = $reply_parse->{id};
+					my $msg_url = "https://gmail.googleapis.com/gmail/v1/users/$email_api_user/messages/$reply_id";
+					my $msg_params = '?format=metadata&metadataHeaders=Message-ID';
+					my $ua = LWP::UserAgent->new;
+					my $req = HTTP::Request->new(
+						GET => $msg_url . $msg_params
+					);
+					$req->header('Authorization' => "Bearer $email_api_pass");
+					$req->header('Content-Type'  => 'application/json');
+					my $res = $ua->request($req);
+					my $msg_data = JSON::decode_json($res->decoded_content);
+					my $retrieved_message_id;
+					if ($msg_data->{payload}{headers}) {
+						foreach my $header (@{$msg_data->{payload}{headers}}) {
+							if (lc($header->{name}) eq 'message-id') {
+								$retrieved_message_id = $header->{value}; # Finally!
+								last;
+							}
+						}
+						if (defined $retrieved_message_id) {
+							$message_id = $retrieved_message_id;
+							printf __("Gmail reassigned Message-ID to: %s\n"), $message_id;
+						} else {
+							warn __("Warning: Could not retrieve Message-ID using the API.\n");
+						}
+					}
+				} else {
+					warn __("Warning: Could not retrieve Message-ID from server response.\n");
+				}
+			} else {
+				die sprintf(__("Failed to send email: %s\nResponse: %s"),
+					$res->code, $res->decoded_content);
+			}
+		} else {
+			die __("The defined API is not supported.")
+		}
 	} else {
 
 		if (!defined $smtp_server) {
@@ -1790,12 +1907,15 @@ EOF
 	} else {
 		print($dry_run ? __("Dry-OK. Log says:") : __("OK. Log says:"));
 		print "\n";
-		if (!defined $sendmail_cmd && !file_name_is_absolute($smtp_server)) {
+		if (!defined $sendmail_cmd && !file_name_is_absolute($smtp_server)
+		   && !defined $email_api) {
 			print "Server: $smtp_server\n";
 			print "MAIL FROM:<$raw_from>\n";
 			foreach my $entry (@recipients) {
 			    print "RCPT TO:<$entry>\n";
 			}
+		} elsif (defined $email_api) {
+			print "Email API: $email_api\n";
 		} else {
 			my $sm;
 			if (defined $sendmail_cmd) {
