@@ -25,6 +25,13 @@ imap.port::
 	Defaults to 143 for imap:// hosts and 993 for imaps:// hosts.
 	Ignored when imap.tunnel is set.
 
+imap.usecurl::
+	A boolean to choose whether to use libcurl or not to communicate
+	with the IMAP server.
+	Ignored if Git was built without `USE_CURL_FOR_IMAP_SEND` option
+	or with `NO_OPENSSL` option set.
+	`--[no]-curl` argument will override this option.
+
 imap.sslverify::
 	A boolean to enable/disable verification of the server certificate
 	used by the SSL/TLS connection. Default is `true`. Ignored when

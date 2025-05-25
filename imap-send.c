@@ -1559,6 +1559,8 @@ static int git_imap_config(const char *var, const char *val,
 		return git_config_string(&cfg->auth_method, var, val);
 	} else if (!strcmp("imap.port", var)) {
 		cfg->port = git_config_int(var, val, ctx->kvi);
+	} else if (!strcmp("imap.usecurl", var)) {
+		use_curl = git_config_bool(var, val);
 	} else if (!strcmp("imap.host", var)) {
 		if (!val) {
 			return config_error_nonbool(var);
