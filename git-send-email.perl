@@ -1,4 +1,47 @@
 #!/usr/bin/perl
+
+# BEGIN RUNTIME_PREFIX generated code.
+#
+# This finds our Git::* libraries relative to the script's runtime path.
+sub __git_system_path {
+	my ($relpath) = @_;
+	my $gitexecdir_relative = 'libexec/git-core';
+
+	# GIT_EXEC_PATH is supplied by `git` or the test suite.
+	my $exec_path;
+	if (exists $ENV{GIT_EXEC_PATH}) {
+		$exec_path = $ENV{GIT_EXEC_PATH};
+	} else {
+		# This can happen if this script is being directly invoked instead of run
+		# by "git".
+		require FindBin;
+		$exec_path = $FindBin::Bin;
+	}
+
+	# Trim off the relative gitexecdir path to get the system path.
+	(my $prefix = $exec_path) =~ s/\Q$gitexecdir_relative\E$//;
+
+	require File::Spec;
+	return File::Spec->catdir($prefix, $relpath);
+}
+
+BEGIN {
+	use lib split /;/,
+	(
+		$ENV{GITPERLLIB} ||
+		do {
+			my $perllibdir = __git_system_path('share/perl5');
+			(-e $perllibdir) || die("Invalid system path ($relpath): $path");
+			$perllibdir;
+		}
+	);
+
+	# Export the system locale directory to the I18N module. The locale directory
+	# is only installed if NO_GETTEXT is set.
+	$Git::I18N::TEXTDOMAINDIR = __git_system_path('share/locale');
+}
+
+# END RUNTIME_PREFIX generated code.
 #
 # Copyright 2002,2005 Greg Kroah-Hartman <greg@kroah.com>
 # Copyright 2005 Ryan Anderson <ryan@michonline.com>
@@ -41,8 +84,6 @@ git send-email --translate-aliases
     --subject               <str>  * Email "Subject:"
     --reply-to              <str>  * Email "Reply-To:"
     --in-reply-to           <str>  * Email "In-Reply-To:"
-    --[no-]outlook-id-fix          * The SMTP host is an Outlook server that munges the
-                                     Message-ID. Retrieve it from the server.
     --[no-]xmailer                 * Add "X-Mailer:" header (default).
     --[no-]annotate                * Review each patch that will be sent in an editor.
     --compose                      * Open an editor for introduction.
@@ -70,7 +111,7 @@ git send-email --translate-aliases
     --smtp-auth             <str>  * Space-separated list of allowed AUTH mechanisms, or
                                      "none" to disable authentication.
                                      This setting forces to use one of the listed mechanisms.
-    --no-smtp-auth                 * Disable SMTP authentication. Shorthand for
+    --no-smtp-auth                   Disable SMTP authentication. Shorthand for
                                      `--smtp-auth=none`
     --smtp-debug            <0|1>  * Disable, enable Net::SMTP debug.
 
@@ -292,7 +333,6 @@ my $validate = 1;
 my $mailmap = 0;
 my $target_xfer_encoding = 'auto';
 my $forbid_sendmail_variables = 1;
-my $outlook_id_fix = 'auto';
 
 my %config_bool_settings = (
     "thread" => \$thread,
@@ -308,7 +348,6 @@ my %config_bool_settings = (
     "xmailer" => \$use_xmailer,
     "forbidsendmailvariables" => \$forbid_sendmail_variables,
     "mailmap" => \$mailmap,
-    "outlookidfix" => \$outlook_id_fix,
 );
 
 my %config_settings = (
@@ -555,7 +594,6 @@ my %options = (
 		    "relogin-delay=i" => \$relogin_delay,
 		    "git-completion-helper" => \$git_completion_helper,
 		    "v=s" => \$reroll_count,
-		    "outlook-id-fix!" => \$outlook_id_fix,
 );
 $rc = GetOptions(%options);
 
@@ -1359,9 +1397,7 @@ sub process_address_list {
 
 sub valid_fqdn {
 	my $domain = shift;
-	my $subdomain = '(?!-)[A-Za-z0-9-]{1,63}(?<!-)';
-	return defined $domain && !($^O eq 'darwin' && $domain =~ /\.local$/)
-		&& $domain  =~ /^$subdomain(?:\.$subdomain)*$/;
+	return defined $domain && !($^O eq 'darwin' && $domain =~ /\.local$/) && $domain =~ /\./;
 }
 
 sub maildomain_net {
@@ -1426,7 +1462,7 @@ sub smtp_auth_maybe {
 		die "invalid smtp auth: '${smtp_auth}'";
 	}
 
-	# Authentication may fail not because credentials were
+	# TODO: Authentication may fail not because credentials were
 	# invalid but due to other reasons, in which we should not
 	# reject credentials.
 	$auth = Git::credential({
@@ -1438,61 +1474,24 @@ sub smtp_auth_maybe {
 		'password' => $smtp_authpass
 	}, sub {
 		my $cred = shift;
-		my $result;
-		my $error;
 
-		# catch all SMTP auth error in a unified eval block
-		eval {
-			if ($smtp_auth) {
-				my $sasl = Authen::SASL->new(
-					mechanism => $smtp_auth,
-					callback => {
-						user     => $cred->{'username'},
-						pass     => $cred->{'password'},
-						authname => $cred->{'username'},
-					}
-				);
-				$result = $smtp->auth($sasl);
-			} else {
-				$result = $smtp->auth($cred->{'username'}, $cred->{'password'});
-			}
-			1; # ensure true value is returned if no exception is thrown
-		} or do {
-			$error = $@ || 'Unknown error';
-		};
+		if ($smtp_auth) {
+			my $sasl = Authen::SASL->new(
+				mechanism => $smtp_auth,
+				callback => {
+					user => $cred->{'username'},
+					pass => $cred->{'password'},
+					authname => $cred->{'username'},
+				}
+			);
 
-		return ($error
-			? handle_smtp_error($error)
-			: ($result ? 1 : 0));
+			return !!$smtp->auth($sasl);
+		}
+
+		return !!$smtp->auth($cred->{'username'}, $cred->{'password'});
 	});
 
 	return $auth;
-}
-
-sub handle_smtp_error {
-	my ($error) = @_;
-
-	# Parse SMTP status code from error message in:
-	# https://www.rfc-editor.org/rfc/rfc5321.html
-	if ($error =~ /\b(\d{3})\b/) {
-		my $status_code = $1;
-		if ($status_code =~ /^4/) {
-			# 4yz: Transient Negative Completion reply
-			warn "SMTP transient error (status code $status_code): $error";
-			return 1;
-		} elsif ($status_code =~ /^5/) {
-			# 5yz: Permanent Negative Completion reply
-			warn "SMTP permanent error (status code $status_code): $error";
-			return 0;
-		}
-		# If no recognized status code is found, treat as transient error
-		warn "SMTP unknown error: $error. Treating as transient failure.";
-		return 1;
-	}
-
-	# If no status code is found, treat as transient error
-	warn "SMTP generic error: $error";
-	return 1;
 }
 
 sub ssl_verify_params {
@@ -1545,7 +1544,7 @@ sub gen_header {
 	@recipients = unique_email_list(@recipients,@cc,@initial_bcc);
 	@recipients = (map { extract_valid_address_or_die($_) } @recipients);
 	my $date = format_2822_time($time++);
-	my $gitversion = '@GIT_VERSION@';
+	my $gitversion = '2.49.0.windows.1';
 	if ($gitversion =~ m/..GIT_VERSION../) {
 	    $gitversion = Git::version();
 	}
@@ -1579,16 +1578,6 @@ Message-ID: $message_id
 	}
 	my $recipients_ref = \@recipients;
 	return ($recipients_ref, $to, $date, $gitversion, $cc, $ccline, $header);
-}
-
-sub is_outlook {
-	my ($host) = @_;
-	if ($outlook_id_fix eq 'auto') {
-		$outlook_id_fix =
-			($host eq 'smtp.office365.com' ||
-			 $host eq 'smtp-mail.outlook.com') ? 1 : 0;
-	}
-	return $outlook_id_fix;
 }
 
 # Prepares the email, then asks the user what to do.
@@ -1639,20 +1628,8 @@ EOF
 		         default => $ask_default);
 		die __("Send this email reply required") unless defined $_;
 		if (/^n/i) {
-			# If we are skipping a message, we should make sure that
-			# the next message is treated as the successor to the
-			# previously sent message, and not the skipped message.
-			$message_num--;
-			$message_id_serial--;
 			return 0;
 		} elsif (/^e/i) {
-			# Since the same message will be sent again, we need to
-			# decrement the message number to the previous message.
-			# Otherwise, the edited message will be treated as a
-			# different message sent after the original non-edited
-			# message.
-			$message_num--;
-			$message_id_serial--;
 			return -1;
 		} elsif (/^q/i) {
 			cleanup_compose_files();
@@ -1766,24 +1743,6 @@ EOF
 			$smtp->datasend("$line") or die $smtp->message;
 		}
 		$smtp->dataend() or die $smtp->message;
-
-		# Outlook discards the Message-ID header we set while sending the email
-		# and generates a new random Message-ID. So in order to avoid breaking
-		# threads, we simply retrieve the Message-ID from the server response
-		# and assign it to the $message_id variable, which will then be
-		# assigned to $in_reply_to by the caller when the next message is sent
-		# as a response to this message.
-		if (is_outlook($smtp_server)) {
-			if ($smtp->message =~ /<([^>]+)>/) {
-				$message_id = "<$1>";
-				# Replace the original Message-ID in $header with the new one
-				$header =~ s/^(Message-ID:\s*).*\n/${1}$message_id\n/m;
-				printf __("Outlook reassigned Message-ID to: %s\n"), $message_id if $smtp->debug;
-			} else {
-				warn __("Warning: Could not retrieve Message-ID from server response.\n");
-			}
-		}
-
 		$smtp->code =~ /250|200/ or die sprintf(__("Failed to send %s\n"), $subject).$smtp->message;
 	}
 	if ($quiet) {
