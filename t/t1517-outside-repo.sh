@@ -59,7 +59,7 @@ test_expect_success 'imap-send outside repository' '
 	test_config_global imap.host imaps://localhost &&
 	test_config_global imap.folder Drafts &&
 
-	echo nothing to send >expect &&
+	echo Nothing to send. >expect &&
 	test_must_fail git imap-send -v </dev/null 2>actual &&
 	test_cmp expect actual &&
 
