@@ -524,9 +524,12 @@ edit `~/.gitconfig` to specify your account settings:
 	smtpServerPort = 587
 ----
 
+Gmail does not allow using your account password for `git send-email`.
 If you have multi-factor authentication set up on your Gmail account, you can
 generate an app-specific password for use with `git send-email`. Visit
 https://security.google.com/settings/security/apppasswords to create it.
+If you do not want to enable multi-factor authentication, you can use OAuth2.0
+authentication as described below.
 
 You can also use OAuth2.0 authentication with Gmail. `OAUTHBEARER` and
 `XOAUTH2` are common methods used for this type of authentication. Gmail
