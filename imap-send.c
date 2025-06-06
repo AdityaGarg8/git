@@ -1102,6 +1102,38 @@ static void server_fill_credential(struct imap_server_conf *srvc, struct credent
 		srvc->pass = xstrdup(cred->password);
 }
 
+static int try_auth_method(struct imap_server_conf *srvc,
+			   struct imap_store *ctx,
+			   struct imap *imap,
+			   const char *auth_method,
+			   enum CAPABILITY cap,
+			   int (*fn)(struct imap_store *, const char *))
+{
+        struct imap_cmd_cb cb = {0};
+
+	if (!CAP(cap)) {
+		fprintf(stderr, "You specified "
+			"%s as authentication method, "
+			"but %s doesn't support it.\n",
+			auth_method, srvc->host);
+		return -1;
+	}
+	cb.cont = fn;
+
+	if (NOT_CONSTANT(!cb.cont)) {
+		fprintf(stderr, "If you want to use %s authentication mechanism, "
+			"you have to build git-imap-send with OpenSSL library.",
+			auth_method);
+		return -1;
+	}
+	if (imap_exec(ctx, &cb, "AUTHENTICATE %s", auth_method) != RESP_OK) {
+		fprintf(stderr, "IMAP error: AUTHENTICATE %s failed\n",
+                	auth_method);
+		return -1;
+	}
+        return 0;
+}
+
 static struct imap_store *imap_open_store(struct imap_server_conf *srvc, const char *folder)
 {
 	struct credential cred = CREDENTIAL_INIT;
@@ -1304,52 +1336,11 @@ static struct imap_store *imap_open_store(struct imap_server_conf *srvc, const c
 					goto bail;
 				}
 			} else if (!strcmp(srvc->auth_method, "OAUTHBEARER")) {
-				if (!CAP(AUTH_OAUTHBEARER)) {
-					fprintf(stderr, "You specified "
-						"OAUTHBEARER as authentication method, "
-						"but %s doesn't support it.\n", srvc->host);
+				if (try_auth_method(srvc, ctx, imap, "OAUTHBEARER", AUTH_OAUTHBEARER, auth_oauthbearer))
 					goto bail;
-				}
-
-				#ifdef NO_OPENSSL
-				fprintf(stderr, "You are trying to use OAUTHBEARER authentication mechanism "
-					"with OpenSSL library, but its support has not been compiled in.");
-				goto bail;
-				#endif
-
-				/* OAUTHBEARER */
-
-				memset(&cb, 0, sizeof(cb));
-				cb.cont = auth_oauthbearer;
-				if (imap_exec(ctx, &cb, "AUTHENTICATE OAUTHBEARER") != RESP_OK) {
-					fprintf(stderr, "IMAP error: AUTHENTICATE OAUTHBEARER failed\n");
-					goto bail;
-				}
 			} else if (!strcmp(srvc->auth_method, "XOAUTH2")) {
-				if (!CAP(AUTH_XOAUTH2)) {
-					fprintf(stderr, "You specified "
-						"XOAUTH2 as authentication method, "
-						"but %s doesn't support it.\n", srvc->host);
+				if (try_auth_method(srvc, ctx, imap, "XOAUTH2", AUTH_XOAUTH2, auth_xoauth2))
 					goto bail;
-				}
-
-				#ifdef NO_OPENSSL
-				fprintf(stderr, "You are trying to use XOAUTH2 authentication mechanism "
-					"with OpenSSL library, but its support has not been compiled in.");
-				goto bail;
-				#endif
-
-				/* XOAUTH2 */
-
-				memset(&cb, 0, sizeof(cb));
-				cb.cont = auth_xoauth2;
-				if (imap_exec(ctx, &cb, "AUTHENTICATE XOAUTH2") != RESP_OK) {
-					fprintf(stderr, "IMAP error: AUTHENTICATE XOAUTH2 failed\n");
-					goto bail;
-				}
-			} else {
-				fprintf(stderr, "unknown authentication method:%s\n", srvc->host);
-				goto bail;
 			}
 		} else {
 			if (CAP(NOLOGIN)) {
