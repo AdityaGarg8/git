@@ -1626,6 +1626,7 @@ sub is_outlook {
 
 sub send_message {
 	my ($recipients_ref, $to, $date, $gitversion, $cc, $ccline, $header) = gen_header();
+	my $result;
 	my @recipients = @$recipients_ref;
 
 	my @sendmail_parameters = ('-i', @recipients);
@@ -1691,19 +1692,32 @@ EOF
 	} elsif ($use_imap_only) {
 		die __("The destination IMAP folder is not properly defined.") if !defined $imap_sent_folder;
 	} elsif (defined $sendmail_cmd || file_name_is_absolute($smtp_server)) {
-		my $pid = open my $sm, '|-';
-		defined $pid or die $!;
-		if (!$pid) {
-			if (defined $sendmail_cmd) {
-				exec ("sh", "-c", "$sendmail_cmd \"\$@\"", "-", @sendmail_parameters)
-					or die $!;
-			} else {
-				exec ($smtp_server, @sendmail_parameters)
-					or die $!;
+		use IPC::Open3;
+		use Symbol 'gensym';
+
+		my $stderr = gensym;
+		my $pid = open3(my $in, my $out, $stderr,
+			defined $sendmail_cmd
+				? ("sh", "-c", "$sendmail_cmd \"\$@\"", "-", @sendmail_parameters)
+				: ($smtp_server, @sendmail_parameters)
+		);
+
+		print $in "$header\n$message";
+		close $in;
+
+		while (<$out>) {
+			if (/git_result=(\S+)/) {
+				$result = $1;
 			}
 		}
-		print $sm "$header\n$message";
-		close $sm or die $!;
+
+		while (my $line = <$stderr>) {
+			print STDERR $line;
+		}
+
+		waitpid($pid, 0);
+		$? == 0 or die $!;
+
 	} else {
 
 		if (!defined $smtp_server) {
@@ -1835,6 +1849,8 @@ EOF
 		if ($smtp) {
 			print __("Result: "), $smtp->code, ' ',
 				($smtp->message =~ /\n([^\n]+\n)$/s);
+		} elsif (defined $result) {
+			print __("Result: "), $result;
 		} else {
 			print __("Result: OK");
 		}
