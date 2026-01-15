@@ -193,6 +193,14 @@ Sending
 	`--smtp-server` is also unspecified, `git send-email` will search
 	for `sendmail` in `/usr/sbin`, `/usr/lib` and `$PATH`.
 
+	In addition to that, any developer can also add the following
+	`git send-email` specific outputs to the stdout of the application:
+
+	----
+	git_result=some_result # Prints the response code. Eg: Result: 202
+	git_message_id=<some_message_id> # Prints the Message-ID of the sent email if changed.
+	----
+
 --smtp-encryption=<encryption>::
 	Specify in what way encrypting begins for the SMTP connection.
 	Valid values are `ssl` and `tls`. Any other value reverts to plain
