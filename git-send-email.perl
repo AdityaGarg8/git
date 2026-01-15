@@ -1709,6 +1709,15 @@ EOF
 			if (/git_result=(\S+)/) {
 				$result = $1;
 			}
+			if (/git_message_id=(\S+)/) {
+				$message_id = $1;
+				if ($message_id !~ /^<[^>]+>$/) {
+					$message_id =~ s/^<+//;
+					$message_id =~ s/>+$//;
+					$message_id = "<$message_id>";
+				}
+				$header =~ s/^(Message-ID:\s*).*\n/${1}$message_id\n/m;
+			}
 		}
 
 		while (my $line = <$stderr>) {
